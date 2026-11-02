@@ -1,0 +1,18 @@
+RTX HDR Unlock
+Copyright (C) 2026 EdLovecraft
+
+Project-authored source code and build scripts are licensed under the
+GNU General Public License, version 3 only (GPL-3.0-only).
+See LICENSE for the complete license text.
+
+Third-party material
+--------------------
+
+src/unlock_kernel.h and src/unlock_ptx.h contain compatibility data extracted
+from NVIDIA driver modules. They are included solely to validate and patch the
+corresponding locally installed driver code in memory.
+
+This project does not claim copyright ownership of NVIDIA driver code, CUDA
+binaries, PTX, or NVIDIA trademarks. Those materials remain subject to
+NVIDIA's own license terms. RTX HDR Unlock is not affiliated with or endorsed
+by NVIDIA Corporation.

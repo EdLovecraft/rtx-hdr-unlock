@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 EdLovecraft
 """Generate x64 ABI-preserving proxy thunks from the local System32 export table."""
 import argparse
 import json

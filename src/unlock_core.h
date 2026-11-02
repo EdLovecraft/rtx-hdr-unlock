@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 EdLovecraft
 #pragma once
 // Shared, version-locked kernel validation and patch transaction.
 #ifndef WIN32_LEAN_AND_MEAN
