@@ -58,15 +58,16 @@ constexpr DWORD kProcessAccess = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ |
                                   PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
 constexpr std::size_t kKernelSize = rtxhdr::kKernelSize;
 constexpr std::uintptr_t kSizeFieldDelta = 0x0c;
+// Pinned to NVIDIA 621.14 (32.0.16.2114) x64; the embedded CUBIN/PTX are unchanged since 621.01.
 constexpr char kNvAiHash[] =
-    "b486759f579b9a08207afd2ef1311e381c021df9098e84e66be4315c1d513766";
+    "7259c5a580fdbdcb9cf96f81583f95b687e3494c0803aee48f41bf1e7a63c5ac";
 constexpr char kNvWgfHash[] =
-    "bb6c170021de9a722eb16c6368faafda0266831d6ba9e8e343bce131f35949dc";
+    "1151c9d103cb9b3149998a5038a1270274fa43506154eff46ed7b86a057e87c1";
 constexpr char kKernelHash[] =
     "f08e2619636e181ecf0fddbee78488b6719f47521ccb8595b5fb12fff6a8d6c6";
 
 constexpr std::uintptr_t kNvAiRva = 0x2bfb60;
-constexpr std::uintptr_t kNvWgfRva = 0x47b8910;
+constexpr std::uintptr_t kNvWgfRva = 0x47b5e70;
 constexpr std::uintptr_t kCodeOffset = 0x980;
 
 constexpr std::array<std::uint32_t, 18> kToleranceInstructions = {
@@ -240,7 +241,7 @@ struct ModuleSpec {
 
 constexpr std::array<ModuleSpec, 2> kModules = {{
     {L"nvAIHDRx.dll", kNvAiHash, kNvAiRva, true, 0x359170},
-    {L"nvwgf2umx.dll", kNvWgfHash, kNvWgfRva, false, 0x45d6450},
+    {L"nvwgf2umx.dll", kNvWgfHash, kNvWgfRva, false, 0x45f3d50},
 }};
 
 const ModuleSpec* FindSpec(const std::wstring& name) {

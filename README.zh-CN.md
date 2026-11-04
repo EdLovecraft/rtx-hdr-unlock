@@ -106,5 +106,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_proxy.ps1
 
 ## 兼容性与安全性
 
-- 为保证安全，当前版本严格绑定已验证的 **NVIDIA 621.01（`32.0.16.2101`）x64** 驱动文件哈希与 **Ada（`SM 8.9`）** 内核哈希。
+- 为保证安全，当前版本严格绑定已验证的 **NVIDIA 621.14（`32.0.16.2114`）x64** 驱动文件哈希与 **Ada（`SM 8.9`）** 内核哈希。
 - 如果驱动更新导致 `nvAIHDRx.dll`、`nvwgf2umx.dll` 或内核字节发生变化，DLL 会自动拒绝打补丁，同时继续正常转发系统 DLL 调用，不会破坏原程序运行。

@@ -106,5 +106,5 @@ The build script:
 
 ## Compatibility & Safety
 
-- Currently locked to **NVIDIA Driver 621.01 (`32.0.16.2101`) x64** and **Ada (`SM 8.9`)** hashes for safety.
+- Currently locked to **NVIDIA Driver 621.14 (`32.0.16.2114`) x64** and **Ada (`SM 8.9`)** hashes for safety.
 - If a future driver changes `nvAIHDRx.dll`, `nvwgf2umx.dll`, or the embedded kernel bytes, the DLL refuses to patch and still forwards normal system DLL calls cleanly.
