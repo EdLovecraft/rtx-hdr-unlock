@@ -144,10 +144,9 @@ std::set<std::filesystem::path> ActiveDriverDirectories() {
   return result;
 }
 
-ModuleInfo LoadedModule(HMODULE handle, const ModuleSpec& spec) {
+ModuleInfo LoadedModule(HMODULE handle, const wchar_t* name) {
   ModuleInfo module;
-  module.spec = spec;
-  module.name = spec.name;
+  module.name = name;
   module.path = ModulePath(handle);
   module.base = reinterpret_cast<std::uintptr_t>(handle);
   IMAGE_DOS_HEADER dos{};
@@ -161,64 +160,133 @@ ModuleInfo LoadedModule(HMODULE handle, const ModuleSpec& spec) {
   return module;
 }
 
+struct PlannedCarrier {
+  Carrier carrier;
+  std::vector<std::uint8_t> original;
+  std::vector<std::uint8_t> patched;
+};
+
+struct ModulePlan {
+  const wchar_t* name = nullptr;
+  std::wstring path;
+  std::vector<PlannedCarrier> carriers;
+};
+
+// Driver-version independent. Every truehdr_drtm carrier in BOTH driver files is
+// located and classified before either module is loaded; a rejection loads
+// nothing and leaves normal forwarding intact. A module is loaded only when it
+// holds a carrier this GPU can execute, and the loaded bytes must equal the
+// classified file bytes (or the exact target patch) before anything is written.
 bool PatchPreloadedModules(const std::filesystem::path& directory) {
   constexpr int peak = kUnlockCeilingNits;
-  std::array<std::wstring, 2> paths;
-  // Check BOTH driver files before loading either. Unsupported versions remain
-  // completely untouched and the normal system forwarding still works.
-  for (std::size_t i = 0; i < kModules.size(); ++i) {
-    paths[i] = (directory / kModules[i].name).wstring();
-    ModuleInfo file;
-    file.spec = kModules[i];
-    file.path = paths[i];
-    if (!ValidateModuleFile(file)) return false;
+  std::array<ModulePlan, kDriverModules.size()> plans;
+  std::size_t usable = 0;
+  std::size_t structural = 0;
+  for (std::size_t i = 0; i < plans.size(); ++i) {
+    ModulePlan& plan = plans[i];
+    plan.name = kDriverModules[i];
+    plan.path = (directory / plan.name).wstring();
+    MappedFile file;
+    if (!MapReadOnly(plan.path, file)) {
+      ProxyTrace() << "WARNING: cannot map " << Narrow(plan.path) << " (" << LastErrorText()
+                   << "); this module is skipped\n";
+      continue;
+    }
+    std::vector<Carrier> carriers;
+    std::string error;
+    if (!ScanImage(file.view, file.size, true, carriers, error)) {
+      ProxyTrace() << "REJECTED: " << Narrow(plan.path) << ": " << error << "; nothing was loaded\n";
+      return false;
+    }
+    ProxyTrace() << Narrow(plan.path) << ": " << carriers.size() << " truehdr_drtm carrier(s)\n";
+    for (auto& carrier : carriers) {
+      carrier.usable = UsableOn(carrier, kSupportedSm);
+      ClassifyCarrier(carrier, peak);
+      ProxyTrace() << "  " << DescribeCarrier(carrier) << '\n';
+    }
+    for (auto& carrier : carriers) {
+      if (!carrier.usable) continue;
+      if (carrier.state != CarrierState::kOriginal) {
+        ProxyTrace() << "REJECTED: a carrier this GPU can execute is "
+                     << (carrier.state == CarrierState::kPatched ? "already modified in the driver file"
+                                                                 : "not structurally recognized")
+                     << "; nothing was loaded\n";
+        return false;
+      }
+      PlannedCarrier planned{carrier, {carrier.view, carrier.view + carrier.size}, {}};
+      auto patched = BuildPatchedCarrier(carrier, planned.original.data(), peak);
+      if (!patched) {
+        ProxyTrace() << "REJECTED: could not build the patched carrier; nothing was loaded\n";
+        return false;
+      }
+      if (carrier.known && Sha256Hex(patched->data(), patched->size()) != carrier.known->patched) {
+        ProxyTrace() << "REJECTED: the patch of a validated carrier does not reproduce the validated "
+                        "result; nothing was loaded\n";
+        return false;
+      }
+      structural += carrier.known ? 0 : 1;
+      planned.patched = std::move(*patched);
+      planned.carrier.view = nullptr;  // the file view is unmapped when this scope ends
+      plan.carriers.push_back(std::move(planned));
+    }
+    usable += plan.carriers.size();
+    if (plan.carriers.empty())
+      ProxyTrace() << "WARNING: " << Narrow(plan.name)
+                   << " has no carrier executable on SM 8.9; it is not loaded or patched\n";
   }
-  const auto variants = BuildCodeVariants(peak);
-  if (!variants) return false;
-  std::array<ModuleInfo, 2> modules;
-  std::array<CodeVariants, 2> originals;
-  for (std::size_t i = 0; i < kModules.size(); ++i) {
-    const bool wasLoaded = GetModuleHandleW(kModules[i].name) != nullptr;
-    HMODULE handle = LoadLibraryExW(paths[i].c_str(), nullptr,
+  if (!usable) {
+    ProxyTrace() << "REJECTED: no truehdr_drtm carrier executable on SM 8.9 was found; "
+                    "nothing was loaded\n";
+    return false;
+  }
+
+  std::vector<CarrierWrite> writes;
+  std::size_t already = 0;
+  for (const auto& plan : plans) {
+    if (plan.carriers.empty()) continue;
+    const bool wasLoaded = GetModuleHandleW(plan.name) != nullptr;
+    HMODULE handle = LoadLibraryExW(plan.path.c_str(), nullptr,
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!handle) throw std::runtime_error("Preload failed: " + LastErrorText());
     // Hold the library until process exit so a reload cannot discard the patch.
     gPinnedDrivers.push_back(handle);
-    modules[i] = LoadedModule(handle, kModules[i]);
-    ProxyTrace() << "Preloaded " << Narrow(modules[i].path)
-                 << "; already_loaded=" << wasLoaded << '\n';
-    if (!ValidateModuleFile(modules[i]) || !ValidateSizeField(GetCurrentProcess(), modules[i])) return false;
-    for (auto source : kCodeSources) {
-      const auto index = std::size_t(source);
-      RangeState state;
-      int existingPeak = 0;
-      if (!QueryRange(GetCurrentProcess(), modules[i], originals[i][index], state, &existingPeak, source) ||
-          state == RangeState::kUnknown ||
-          (state == RangeState::kPatched && existingPeak != peak)) {
-        ProxyTrace() << "Rejected unknown source or different existing peak; no writes.\n";
+    const ModuleInfo module = LoadedModule(handle, plan.name);
+    ProxyTrace() << "Preloaded " << Narrow(module.path) << "; already_loaded=" << wasLoaded << '\n';
+    for (const auto& planned : plan.carriers) {
+      const Carrier& carrier = planned.carrier;
+      const std::string label = Narrow(plan.name) + (carrier.kind == CarrierKind::kCubin ? " CUBIN" : " PTX");
+      std::vector<std::uint8_t> current(carrier.size);
+      const std::uintptr_t address = module.base + carrier.rva;
+      if (carrier.rva > module.size || carrier.size > module.size - carrier.rva ||
+          !IsRangeReadable(GetCurrentProcess(), address, current.size()) ||
+          !ReadRemote(GetCurrentProcess(), address, current.data(), current.size())) {
+        ProxyTrace() << "REJECTED: " << label << " is not readable in the loaded image; no writes\n";
+        return false;
+      }
+      if (current == planned.original) {
+        writes.push_back({label, address, planned.original, planned.patched});
+      } else if (current == planned.patched) {
+        ++already;
+      } else {
+        ProxyTrace() << "REJECTED: loaded " << label
+                     << " differs from the driver file and from the target patch; no writes\n";
         return false;
       }
     }
   }
-  for (std::size_t i = 0; i < modules.size(); ++i) {
-    // These are preloaded, process-local data carriers, before first graphics use.
-    // Never invoke the external tool's thread suspension on our own calling thread.
-    if (!UpdateModuleSources(GetCurrentProcess(), GetCurrentProcessId(), modules[i],
-                             *variants, peak, false, true, true, true)) {
-      for (std::size_t earlier = i; earlier-- > 0;) {
-        for (auto source : kCodeSources) {
-          const auto index = std::size_t(source);
-          if (!WriteRemote(GetCurrentProcess(), GetCurrentProcessId(),
-                           modules[earlier].base + SourceRva(modules[earlier].spec, source),
-                           (*variants)[index], originals[earlier][index], true))
-            ProxyTrace() << "ERROR: cross-module rollback could not be confirmed\n";
-        }
-      }
-      return false;
-    }
+  // These are preloaded, process-local data carriers, before first graphics use.
+  // Never invoke the external tool's thread suspension on our own calling thread.
+  if (!writes.empty() &&
+      !ApplyCarrierWrites(GetCurrentProcess(), GetCurrentProcessId(), writes, true)) {
+    ProxyTrace() << "REJECTED: the write transaction failed and was rolled back\n";
+    return false;
   }
-  ProxyTrace() << "PATCH_READY peak=" << peak
-               << "; both NVIDIA modules, CUBIN+PTX; requires initialization before first HDR use.\n";
+  ProxyTrace() << "PATCH_READY peak=" << peak << "; tier="
+               << (structural ? "structural (" + std::to_string(structural) +
+                                    " carrier(s) not byte-identical to a validated release)"
+                              : std::string("known"))
+               << "; carriers=" << usable << " (" << writes.size() << " written, " << already
+               << " already patched); requires initialization before first HDR use.\n";
   return true;
 }
 
@@ -240,6 +308,8 @@ BOOL CALLBACK InitializePatch(PINIT_ONCE, PVOID, PVOID*) noexcept {
     const auto library = ProxyLibrary();
     ProxyTrace() << "Mode=" << (library.empty() ? "ASI/plugin" : Narrow(library)) << '\n';
     ProxyTrace() << "Fixed unlock ceiling=" << kUnlockCeilingNits << " nits\n";
+    ProxyTrace() << "Carrier discovery: content scan of the active driver files; "
+                    "no driver version, file hash or RVA pin\n";
     if (!EnsureCuda89()) {
       gPatchStatus.store(-1);
     } else {

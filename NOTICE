@@ -8,9 +8,9 @@ See LICENSE for the complete license text.
 Third-party material
 --------------------
 
-src/unlock_kernel.h and src/unlock_ptx.h contain compatibility data extracted
-from NVIDIA driver modules. They are included solely to validate and patch the
-corresponding locally installed driver code in memory.
+This repository contains no NVIDIA driver code. RTX HDR Unlock locates the RTX
+HDR kernels in the locally installed NVIDIA driver at run time and patches that
+code only in the memory of the process that loads it.
 
 This project does not claim copyright ownership of NVIDIA driver code, CUDA
 binaries, PTX, or NVIDIA trademarks. Those materials remain subject to

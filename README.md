@@ -42,8 +42,8 @@ Or, if the game already uses an ASI Loader, rename it to any `.asi` name such as
 When the file loads, it creates `RtxHdrUnlock.log` in the same folder and clears previous log contents on every new load:
 
 - `DLL_LOADED`: the file was loaded into the process.
-- `PATCH_READY`: both NVIDIA HDR driver modules and both GPU code sources (`CUBIN` and `PTX`) were verified and patched in memory.
-- `REJECTED`: the driver version, GPU architecture, or module state did not match, so nothing was changed.
+- `PATCH_READY`: every RTX HDR kernel copy (`CUBIN` and `PTX`) that this GPU can run was found in the NVIDIA driver modules, verified, and patched in memory. `tier=known` means the kernel is byte-identical to one validated for this release; `tier=structural` means a newer driver build whose kernel still has exactly the expected structure.
+- `REJECTED`: the GPU architecture or a kernel did not match the expected structure, so nothing was changed.
 
 ### Important Notes
 
@@ -64,17 +64,17 @@ Because of those constants, values above `1.0` are pulled back to roughly 1000 n
 `RtxHdrUnlock.dll` fixes this in process memory before RTX HDR runs:
 
 1. In `DllMain`, it only records the module handle and writes the initial `DLL_LOADED` line to `RtxHdrUnlock.log`. It avoids heavy work inside the Windows loader lock.
-2. On the first forwarded export call (or `InitializeASI`), it locates the active signed NVIDIA driver folder, verifies the SHA-256 of `nvAIHDRx.dll` and `nvwgf2umx.dll` on disk, and preloads them into the current process.
-3. It checks that the embedded original `truehdr_drtm` **CUBIN** (`113,216` bytes) and **PTX** (`244,273` bytes) match the known SHA-256 hashes.
-4. It patches only the **36** upper-bound constants across the three Oklab clamp paths (`18` tolerance values to `2.001` and `18` final clamp values to `2.0`), preserving the exact blob lengths, register count, and surrounding algorithm.
-5. Every write is verified by readback. If any step fails, all modified bytes and memory protections are rolled back automatically.
+2. On the first forwarded export call (or `InitializeASI`), it locates the active NVIDIA driver folder and, **before loading anything**, scans `nvAIHDRx.dll` and `nvwgf2umx.dll` on disk for every embedded `truehdr_drtm` kernel: native **CUBIN** images (CUDA ELF, both the current and the CUDA 13 format) and **PTX** text. Nothing is tied to a driver version, file hash, or memory address.
+3. For each kernel copy this GPU can run (an SM 8.x CUBIN or the PTX), it derives the patch locations from the code itself: the 18 Oklab in-gamut tests against `1.001` (each paired with its `-0.001` test) and, on the same candidate channels, the final `min(c, 1.0)` clamps, whether compiled as compare-and-select or as a single minimum instruction. Any deviation from that structure rejects the whole patch.
+4. It preloads only the modules that hold such a kernel, confirms the loaded bytes equal the file, and changes only those upper-bound constants (tolerance to `2.001`, clamp to `2.0`): **36** per kernel in current drivers. Blob lengths, register counts, and the surrounding algorithm stay unchanged.
+5. Every write is verified by readback. If any step fails, all modified bytes and memory protections in both modules are rolled back automatically.
 
 ```mermaid
 flowchart LR
   A[Game loads renamed DLL or ASI] --> B[First API call / InitializeASI]
-  B --> C[Verify signed nvAIHDRx.dll and nvwgf2umx.dll on disk]
-  C --> D[Preload driver modules into current process]
-  D --> E[Patch 36 Oklab upper-bound constants in CUBIN and PTX to 2000 nits]
+  B --> C[Scan nvAIHDRx.dll and nvwgf2umx.dll on disk for truehdr_drtm CUBIN/PTX]
+  C --> D[Locate the Oklab tolerance tests and ceiling clamps; reject any mismatch]
+  D --> E[Preload modules and patch the located constants to 2000 nits]
   E --> F[Readback check and flush instruction cache]
   F --> G[Forward calls to real System32 DLL]
 ```
@@ -106,5 +106,7 @@ The build script:
 
 ## Compatibility & Safety
 
-- Currently locked to **NVIDIA Driver 621.14 (`32.0.16.2114`) x64** and **Ada (`SM 8.9`)** hashes for safety.
-- If a future driver changes `nvAIHDRx.dll`, `nvwgf2umx.dll`, or the embedded kernel bytes, the DLL refuses to patch and still forwards normal system DLL calls cleanly.
+- Not tied to a driver version. The same binary was verified with NVIDIA **616.92, 617.42, 621.01, and 621.14** x64. Every kernel copy those drivers contain is byte-identical across them (616.92 and 617.42 have no PTX copy yet); only the locations changed.
+- A future driver that recompiles the kernel is still patched when the code keeps the same structure (reported as `tier=structural`). If the structure differs, the DLL refuses to patch and still forwards normal system DLL calls cleanly.
+- Requires an **Ada (`SM 8.9`)** GPU, as before.
+- After a driver update, `python tools/carrier_locator.py` shows what the DLL will do with the installed driver, and `python tools/carrier_locator.py --cuda-ab` (requires `numpy`) repeats the highlight check in a separate CUDA process.

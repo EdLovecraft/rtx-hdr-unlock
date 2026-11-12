@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 EdLovecraft
 #pragma once
-// Shared, version-locked kernel validation and patch transaction.
+// Shared, driver-version-independent kernel discovery, validation and patch
+// transaction. Nothing is pinned to RVAs, file offsets or driver file hashes:
+// every truehdr_drtm CUBIN/PTX carrier is located by content, and its patch
+// sites are derived from the code itself. Any deviation from the expected
+// structure rejects the whole patch.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -9,7 +13,6 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <bcrypt.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
@@ -18,29 +21,29 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <cwctype>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-#include "unlock_kernel.h"
-#include "unlock_ptx.h"
-
-#pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "user32.lib")
 
 #ifndef RTXHDR_OUT
@@ -53,31 +56,12 @@
 namespace {
 
 constexpr int kUnlockCeilingNits = 2000;
+// EnsureCuda89() admits only SM 8.9 devices. Carriers such a device can execute
+// are patched: SM 8.x CUBINs up to 8.9, and PTX whose target is at most sm_89.
+constexpr int kSupportedSm = 89;
 
 constexpr DWORD kProcessAccess = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ |
                                   PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
-constexpr std::size_t kKernelSize = rtxhdr::kKernelSize;
-constexpr std::uintptr_t kSizeFieldDelta = 0x0c;
-// Pinned to NVIDIA 621.14 (32.0.16.2114) x64; the embedded CUBIN/PTX are unchanged since 621.01.
-constexpr char kNvAiHash[] =
-    "7259c5a580fdbdcb9cf96f81583f95b687e3494c0803aee48f41bf1e7a63c5ac";
-constexpr char kNvWgfHash[] =
-    "1151c9d103cb9b3149998a5038a1270274fa43506154eff46ed7b86a057e87c1";
-constexpr char kKernelHash[] =
-    "f08e2619636e181ecf0fddbee78488b6719f47521ccb8595b5fb12fff6a8d6c6";
-
-constexpr std::uintptr_t kNvAiRva = 0x2bfb60;
-constexpr std::uintptr_t kNvWgfRva = 0x47b5e70;
-constexpr std::uintptr_t kCodeOffset = 0x980;
-
-constexpr std::array<std::uint32_t, 18> kToleranceInstructions = {
-    0x31a0, 0x31f0, 0x3210, 0x3510, 0x3560, 0x3580,
-    0xbe40, 0xbe90, 0xbeb0, 0xc1b0, 0xc200, 0xc220,
-    0x16450, 0x164a0, 0x164c0, 0x167c0, 0x16810, 0x16830};
-constexpr std::array<std::uint32_t, 18> kPeakInstructions = {
-    0x3630, 0x3640, 0x3670, 0x3680, 0x3690, 0x36e0,
-    0xc2a0, 0xc2b0, 0xc2e0, 0xc2f0, 0xc300, 0xc350,
-    0x168b0, 0x168c0, 0x168f0, 0x16900, 0x16910, 0x16960};
 
 std::atomic_bool gStop{false};
 std::atomic_int gCudaCheck{0};  // 0=unknown, 1=validated, -1=unavailable
@@ -156,104 +140,117 @@ class Handle {
   HANDLE value_ = nullptr;
 };
 
-std::optional<std::array<std::uint8_t, 32>> Sha256File(const std::wstring& path) {
-  Handle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE |
-                                        FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-                                        nullptr));
-  if (!file) return std::nullopt;
-
-  BCRYPT_ALG_HANDLE algorithm = nullptr;
-  BCRYPT_HASH_HANDLE hash = nullptr;
-  DWORD objectLength = 0;
-  DWORD resultLength = 0;
-  if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0 ||
-      BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
-                        reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
-                        &resultLength, 0) < 0) {
-    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
-    return std::nullopt;
-  }
-  std::vector<UCHAR> object(objectLength);
-  if (BCryptCreateHash(algorithm, &hash, object.data(), objectLength, nullptr, 0, 0) < 0) {
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-    return std::nullopt;
-  }
-  std::array<std::uint8_t, 64 * 1024> buffer{};
-  DWORD read = 0;
-  bool ok = true;
-  for (;;) {
-    if (!ReadFile(file.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &read,
-                  nullptr)) {
-      ok = false;
-      break;
-    }
-    if (read == 0) break;
-    if (BCryptHashData(hash, buffer.data(), read, 0) < 0) {
-      ok = false;
-      break;
+// Self-contained SHA-256 (FIPS 180-4). Carrier identification deliberately
+// avoids CNG: BCryptOpenAlgorithmProvider can LoadLibrary a provider while a
+// driver thread-attach callback waits inside BCryptGenRandom, which deadlocked
+// a fixture once (analysis/proxy_build/rollback_hang_debugger.log).
+class Sha256 {
+ public:
+  void Update(const std::uint8_t* data, std::size_t size) {
+    length_ += size;
+    while (size) {
+      const std::size_t take = std::min(size, buffer_.size() - used_);
+      std::memcpy(buffer_.data() + used_, data, take);
+      used_ += take;
+      data += take;
+      size -= take;
+      if (used_ == buffer_.size()) {
+        Block(buffer_.data());
+        used_ = 0;
+      }
     }
   }
-  std::array<std::uint8_t, 32> digest{};
-  if (ok && BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) < 0)
-    ok = false;
-  BCryptDestroyHash(hash);
-  BCryptCloseAlgorithmProvider(algorithm, 0);
-  if (!ok) return std::nullopt;
-  return digest;
-}
 
-std::optional<std::array<std::uint8_t, 32>> Sha256Bytes(const std::uint8_t* data,
-                                                        std::size_t size) {
-  BCRYPT_ALG_HANDLE algorithm = nullptr;
-  BCRYPT_HASH_HANDLE hash = nullptr;
-  DWORD objectLength = 0;
-  DWORD resultLength = 0;
-  if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0 ||
-      BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
-                        reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
-                        &resultLength, 0) < 0) {
-    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
-    return std::nullopt;
+  std::array<std::uint8_t, 32> Finish() {
+    const std::uint64_t bits = length_ * 8;
+    buffer_[used_++] = 0x80;
+    if (used_ > 56) {
+      std::fill(buffer_.begin() + used_, buffer_.end(), std::uint8_t{0});
+      Block(buffer_.data());
+      used_ = 0;
+    }
+    std::fill(buffer_.begin() + used_, buffer_.begin() + 56, std::uint8_t{0});
+    for (int i = 0; i < 8; ++i) buffer_[56 + i] = std::uint8_t(bits >> (56 - 8 * i));
+    Block(buffer_.data());
+    std::array<std::uint8_t, 32> digest{};
+    for (int i = 0; i < 8; ++i)
+      for (int j = 0; j < 4; ++j) digest[4 * i + j] = std::uint8_t(state_[i] >> (24 - 8 * j));
+    return digest;
   }
-  std::vector<UCHAR> object(objectLength);
-  if (BCryptCreateHash(algorithm, &hash, object.data(), objectLength, nullptr, 0, 0) < 0) {
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-    return std::nullopt;
-  }
-  bool ok = BCryptHashData(hash, const_cast<PUCHAR>(data), static_cast<ULONG>(size), 0) >= 0;
-  std::array<std::uint8_t, 32> digest{};
-  if (ok && BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) < 0)
-    ok = false;
-  BCryptDestroyHash(hash);
-  BCryptCloseAlgorithmProvider(algorithm, 0);
-  if (!ok) return std::nullopt;
-  return digest;
-}
 
-struct ModuleSpec {
-  const wchar_t* name;
-  const char* fileSha256;
-  std::uintptr_t rva;
-  bool hasSizeField;
-  std::uintptr_t ptxRva;
+ private:
+  static std::uint32_t Rotr(std::uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+
+  void Block(const std::uint8_t* p) {
+    static constexpr std::uint32_t k[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2};
+    std::uint32_t w[64];
+    for (int i = 0; i < 16; ++i)
+      w[i] = std::uint32_t(p[4 * i]) << 24 | std::uint32_t(p[4 * i + 1]) << 16 |
+             std::uint32_t(p[4 * i + 2]) << 8 | std::uint32_t(p[4 * i + 3]);
+    for (int i = 16; i < 64; ++i) {
+      const std::uint32_t s0 = Rotr(w[i - 15], 7) ^ Rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+      const std::uint32_t s1 = Rotr(w[i - 2], 17) ^ Rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+      w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    std::uint32_t a = state_[0], b = state_[1], c = state_[2], d = state_[3];
+    std::uint32_t e = state_[4], f = state_[5], g = state_[6], h = state_[7];
+    for (int i = 0; i < 64; ++i) {
+      const std::uint32_t t1 = h + (Rotr(e, 6) ^ Rotr(e, 11) ^ Rotr(e, 25)) +
+                               ((e & f) ^ (~e & g)) + k[i] + w[i];
+      const std::uint32_t t2 = (Rotr(a, 2) ^ Rotr(a, 13) ^ Rotr(a, 22)) +
+                               ((a & b) ^ (a & c) ^ (b & c));
+      h = g;
+      g = f;
+      f = e;
+      e = d + t1;
+      d = c;
+      c = b;
+      b = a;
+      a = t1 + t2;
+    }
+    state_[0] += a;
+    state_[1] += b;
+    state_[2] += c;
+    state_[3] += d;
+    state_[4] += e;
+    state_[5] += f;
+    state_[6] += g;
+    state_[7] += h;
+  }
+
+  std::array<std::uint32_t, 8> state_ = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                                          0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+  std::array<std::uint8_t, 64> buffer_{};
+  std::size_t used_ = 0;
+  std::uint64_t length_ = 0;
 };
 
-constexpr std::array<ModuleSpec, 2> kModules = {{
-    {L"nvAIHDRx.dll", kNvAiHash, kNvAiRva, true, 0x359170},
-    {L"nvwgf2umx.dll", kNvWgfHash, kNvWgfRva, false, 0x45f3d50},
-}};
+std::string Sha256Hex(const std::uint8_t* data, std::size_t size) {
+  Sha256 hash;
+  hash.Update(data, size);
+  return Hex(hash.Finish());
+}
 
-const ModuleSpec* FindSpec(const std::wstring& name) {
+constexpr std::array<const wchar_t*, 2> kDriverModules = {L"nvAIHDRx.dll", L"nvwgf2umx.dll"};
+
+bool IsDriverModule(const std::wstring& name) {
   const std::wstring lower = Lower(name);
-  for (const auto& spec : kModules) {
-    if (lower == Lower(spec.name)) return &spec;
-  }
-  return nullptr;
+  for (const auto* module : kDriverModules)
+    if (lower == Lower(module)) return true;
+  return false;
 }
 
 struct ModuleInfo {
-  ModuleSpec spec{};
   std::wstring name;
   std::wstring path;
   std::uintptr_t base = 0;
@@ -268,10 +265,8 @@ std::vector<ModuleInfo> ModulesForPid(DWORD pid) {
   entry.dwSize = sizeof(entry);
   if (!Module32FirstW(snapshot.get(), &entry)) return result;
   do {
-    const ModuleSpec* spec = FindSpec(entry.szModule);
-    if (spec) {
+    if (IsDriverModule(entry.szModule)) {
       ModuleInfo info;
-      info.spec = *spec;
       info.name = entry.szModule;
       info.path = entry.szExePath;
       info.base = reinterpret_cast<std::uintptr_t>(entry.modBaseAddr);
@@ -300,43 +295,54 @@ bool ReadRemote(HANDLE process, std::uintptr_t address, void* data, std::size_t 
                             &read) && read == size;
 }
 
+// Walks every region in the range: pages written once (by this patch, another
+// instance or a tool) become private copies with their own protection, so one
+// carrier can span several regions.
 bool IsRangeReadable(HANDLE process, std::uintptr_t address, std::size_t size) {
-  MEMORY_BASIC_INFORMATION info{};
-  if (!VirtualQueryEx(process, reinterpret_cast<const void*>(address), &info,
-                      sizeof(info)))
+  const std::uintptr_t end = address + size;
+  if (end < address) return false;
+  for (std::uintptr_t cursor = address; cursor < end;) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQueryEx(process, reinterpret_cast<const void*>(cursor), &info, sizeof(info)))
+      return false;
+    const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+    if (info.State != MEM_COMMIT || cursor < begin || !info.RegionSize ||
+        (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+      return false;
+    cursor = begin + info.RegionSize;
+  }
+  return true;
+}
+
+// A read-only view of a driver file. Carriers are classified from the file
+// before any driver module is loaded.
+struct MappedFile {
+  MappedFile() = default;
+  MappedFile(const MappedFile&) = delete;
+  MappedFile& operator=(const MappedFile&) = delete;
+  ~MappedFile() {
+    if (view) UnmapViewOfFile(view);
+  }
+  Handle file;
+  Handle mapping;
+  const std::uint8_t* view = nullptr;
+  std::size_t size = 0;
+};
+
+bool MapReadOnly(const std::wstring& path, MappedFile& out) {
+  out.file.reset(CreateFileW(path.c_str(), GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+  LARGE_INTEGER size{};
+  if (!out.file || !GetFileSizeEx(out.file.get(), &size) || size.QuadPart <= 0 ||
+      size.QuadPart > (std::int64_t{1} << 31))
     return false;
-  const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
-  if (info.State != MEM_COMMIT || address < begin) return false;
-  const auto available = info.RegionSize - (address - begin);
-  return available >= size;
-}
-
-enum class RangeState { kOriginal, kPatched, kUnknown };
-
-enum class CodeSource { kCubin = 0, kPtx = 1 };
-constexpr std::array<CodeSource, 2> kCodeSources = {CodeSource::kCubin, CodeSource::kPtx};
-using CodeVariants = std::array<std::vector<std::uint8_t>, 2>;
-
-const char* SourceName(CodeSource source) {
-  return source == CodeSource::kCubin ? "CUBIN" : "PTX";
-}
-
-std::size_t SourceSize(CodeSource source) {
-  return source == CodeSource::kCubin ? kKernelSize : rtxhdr::kPtxSize;
-}
-
-std::uintptr_t SourceRva(const ModuleSpec& module, CodeSource source) {
-  return source == CodeSource::kCubin ? module.rva : module.ptxRva;
-}
-
-std::uint32_t ReadU32(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
-  std::uint32_t value = 0;
-  std::memcpy(&value, bytes.data() + offset, sizeof(value));
-  return value;
-}
-
-void WriteU32(std::vector<std::uint8_t>& bytes, std::size_t offset, std::uint32_t value) {
-  std::memcpy(bytes.data() + offset, &value, sizeof(value));
+  out.mapping.reset(CreateFileMappingW(out.file.get(), nullptr, PAGE_READONLY, 0, 0, nullptr));
+  if (!out.mapping) return false;
+  out.view = static_cast<const std::uint8_t*>(
+      MapViewOfFile(out.mapping.get(), FILE_MAP_READ, 0, 0, 0));
+  out.size = static_cast<std::size_t>(size.QuadPart);
+  return out.view != nullptr;
 }
 
 std::uint32_t FloatBits(float value) {
@@ -345,296 +351,679 @@ std::uint32_t FloatBits(float value) {
   return bits;
 }
 
-float BitsFloat(std::uint32_t bits) {
-  float value = 0;
-  std::memcpy(&value, &bits, sizeof(value));
+struct CeilingConstants {
+  std::uint32_t tolerance;  // in-gamut upper test, (ceiling + 1 nit) / 1000
+  std::uint32_t ceiling;    // final channel clamp, ceiling / 1000
+};
+constexpr CeilingConstants kOriginalConstants{0x3F8020C5u, 0x3F800000u};  // 1.001, 1.0
+constexpr std::uint32_t kLowerBoundBits = 0xBA83126Fu;                    // -0.001
+
+CeilingConstants TargetConstants(int nits) {
+  // Same rounding as the validated generators: one double division, one float rounding.
+  return {FloatBits(static_cast<float>(static_cast<double>(nits + 1) / 1000.0)),
+          FloatBits(static_cast<float>(static_cast<double>(nits) / 1000.0))};
+}
+
+enum class CarrierKind { kCubin, kPtx };
+enum class CarrierState { kInvalid, kOriginal, kPatched };
+
+struct PatchSite {
+  std::uint32_t offset;  // byte offset from the carrier start
+  bool tolerance;        // in-gamut test bound; otherwise the final ceiling clamp
+};
+
+struct KnownCarrier {
+  const char* label;
+  const char* original;  // SHA-256 of the unmodified carrier
+  const char* patched;   // SHA-256 after the kUnlockCeilingNits patch
+};
+
+// Carriers whose patched form passed the real HDR A/B in this project
+// (analysis/fixed2000_release.md). Byte-identical in NVIDIA 616.92 through
+// 621.14 (the PTX first appears in 621.01). Other carriers are patched only
+// when the structural locator accepts them, and the log reports them as
+// tier=structural.
+static_assert(kUnlockCeilingNits == 2000, "kKnownCarriers lists 2000-nit patched hashes");
+constexpr std::array<KnownCarrier, 2> kKnownCarriers = {{
+    {"validated sm80 CUBIN", "f08e2619636e181ecf0fddbee78488b6719f47521ccb8595b5fb12fff6a8d6c6",
+     "c30752fe8783535691a64ad3eaa46ae5a865a3beb070c66731af0f34a6bd5e28"},
+    {"validated PTX", "d41d157c91be935c2a84217bb38686d140bcfde70606f640aeeaba8aa0c56776",
+     "972d512e0ae905ea9dca21d4314f02139479b581111d1983aa4ddc6155bb94b5"},
+}};
+
+struct Carrier {
+  CarrierKind kind = CarrierKind::kCubin;
+  std::uintptr_t rva = 0;      // image RVA, or offset inside a bare buffer
+  std::size_t size = 0;
+  int sm = 0;                  // CUBIN: ELF SM; PTX: .target sm_XX; 0 unknown; -1 arch-specific
+  int elfAbi = 0;              // CUBIN ELF OSABI: 0x33 (ABI 7) or 0x41 (ABI 8)
+  std::size_t codeOffset = 0;  // CUBIN: .text.truehdr_drtm offset; PTX: entry offset
+  std::size_t codeSize = 0;    // CUBIN: .text.truehdr_drtm size
+  const std::uint8_t* view = nullptr;  // scanned bytes; valid only while they stay mapped
+  bool usable = false;         // executable on kSupportedSm
+  CarrierState state = CarrierState::kInvalid;
+  std::vector<PatchSite> sites;
+  std::string idiom;
+  std::string reason;
+  std::string sha256;
+  const KnownCarrier* known = nullptr;
+};
+
+template <typename T>
+T LoadLe(const std::uint8_t* p) {
+  T value{};
+  std::memcpy(&value, p, sizeof(value));
   return value;
 }
 
-std::vector<std::size_t> ChangedOffsets() {
-  std::vector<std::size_t> offsets;
-  offsets.reserve(36);
-  for (const auto instruction : kToleranceInstructions)
-    offsets.push_back(kCodeOffset + instruction + 4);
-  for (const auto instruction : kPeakInstructions)
-    offsets.push_back(kCodeOffset + instruction + 4);
-  return offsets;
+std::size_t FindText(std::string_view haystack, std::size_t from, std::string_view needle) {
+  if (from >= haystack.size() || haystack.size() - from < needle.size())
+    return std::string_view::npos;
+  const auto begin = haystack.begin() + static_cast<std::ptrdiff_t>(from);
+  const auto it = std::search(begin, haystack.end(),
+                              std::boyer_moore_horspool_searcher(needle.begin(), needle.end()));
+  return it == haystack.end() ? std::string_view::npos
+                              : static_cast<std::size_t>(it - haystack.begin());
 }
 
-bool IsOriginal(const std::vector<std::uint8_t>& bytes) {
-  if (bytes.size() != kKernelSize) return false;
-  return std::memcmp(bytes.data(), rtxhdr::kOriginalKernel.data(), kKernelSize) == 0;
-}
+constexpr std::string_view kDrtmText = ".text.truehdr_drtm";
+constexpr std::string_view kPtxEntry = ".entry truehdr_drtm(";
 
-bool IsPatched(const std::vector<std::uint8_t>& bytes, int* peakNits = nullptr) {
-  if (bytes.size() != kKernelSize) return false;
-  const auto offsets = ChangedOffsets();
-  std::vector<bool> changed(kKernelSize, false);
-  for (const auto offset : offsets)
-    for (std::size_t i = 0; i < 4; ++i) changed[offset + i] = true;
-  for (std::size_t i = 0; i < kKernelSize; ++i) {
-    if (!changed[i] && bytes[i] != rtxhdr::kOriginalKernel[i]) return false;
-  }
-  const std::uint32_t tolerance = ReadU32(bytes, offsets[0]);
-  const std::uint32_t peak = ReadU32(bytes, offsets[18]);
-  if (tolerance == 0x3f8020c5) return false;
-  for (std::size_t i = 0; i < 18; ++i) {
-    if (ReadU32(bytes, offsets[i]) != tolerance ||
-        ReadU32(bytes, offsets[18 + i]) != peak)
-      return false;
-  }
-  for (int setting = 1000; setting <= 2000; ++setting) {
-    // Match the Python generator: perform the division in double precision
-    // and round once when converting to the SASS float immediate.
-    const auto expectedPeak =
-        FloatBits(static_cast<float>(static_cast<double>(setting) / 1000.0));
-    const auto expectedTolerance =
-        FloatBits(static_cast<float>(static_cast<double>(setting + 1) / 1000.0));
-    if (peak == expectedPeak && tolerance == expectedTolerance) {
-      if (peakNits) *peakNits = setting;
-      return true;
-    }
-  }
-  return false;
-}
+struct ElfLayout {
+  std::size_t size = 0;
+  int sm = 0;
+  int abi = 0;
+  std::size_t text = 0;
+  std::size_t textSize = 0;
+  int drtmTexts = 0;
+};
 
-std::optional<std::vector<std::uint8_t>> BuildVariant(int peakNits) {
-  if (peakNits < 1000 || peakNits > 2000) return std::nullopt;
-  std::vector<std::uint8_t> bytes(rtxhdr::kOriginalKernel.begin(),
-                                  rtxhdr::kOriginalKernel.end());
-  const std::uint32_t tolerance =
-      FloatBits(static_cast<float>(static_cast<double>(peakNits + 1) / 1000.0));
-  const std::uint32_t peak =
-      FloatBits(static_cast<float>(static_cast<double>(peakNits) / 1000.0));
-  for (const auto instruction : kToleranceInstructions) {
-    const std::size_t offset = kCodeOffset + instruction + 4;
-    if (ReadU32(bytes, offset) != 0x3f8020c5) return std::nullopt;
-    WriteU32(bytes, offset, tolerance);
-  }
-  for (const auto instruction : kPeakInstructions) {
-    const std::size_t offset = kCodeOffset + instruction + 4;
-    if (ReadU32(bytes, offset) != 0x3f800000) return std::nullopt;
-    WriteU32(bytes, offset, peak);
-  }
-  return bytes;
-}
-
-bool IsOriginalPtx(const std::vector<std::uint8_t>& bytes) {
-  return bytes.size() == rtxhdr::kPtxSize &&
-         std::memcmp(bytes.data(), rtxhdr::kOriginalPtx.data(), bytes.size()) == 0;
-}
-
-std::optional<std::uint32_t> ReadPtxLiteral(const std::vector<std::uint8_t>& bytes,
-                                         std::size_t offset) {
-  if (offset > bytes.size() || bytes.size() - offset < 10 ||
-      bytes[offset] != '0' || bytes[offset + 1] != 'f') return std::nullopt;
-  std::uint32_t bits = 0;
-  for (std::size_t i = 2; i < 10; ++i) {
-    const auto c = bytes[offset + i];
-    if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) return std::nullopt;
-    bits = (bits << 4) | static_cast<std::uint32_t>(c <= '9' ? c - '0' : c - 'A' + 10);
-  }
-  return bits;
-}
-
-void WritePtxLiteral(std::vector<std::uint8_t>& bytes, std::size_t offset,
-                     std::uint32_t bits) {
-  char literal[11]{};
-  std::snprintf(literal, sizeof(literal), "0f%08X", static_cast<unsigned int>(bits));
-  std::memcpy(bytes.data() + offset, literal, 10);
-}
-
-bool IsPatchedPtx(const std::vector<std::uint8_t>& bytes, int* peakNits = nullptr) {
-  if (bytes.size() != rtxhdr::kPtxSize) return false;
-  std::vector<std::uint8_t> normalized(bytes);
-  std::optional<std::uint32_t> peak;
-  std::optional<std::uint32_t> tolerance;
-  for (const auto& site : rtxhdr::kPtxLiteralSites) {
-    const auto bits = ReadPtxLiteral(bytes, site.offset);
-    if (!bits) return false;
-    auto& expected = site.tolerance ? tolerance : peak;
-    if (expected && *expected != *bits) return false;
-    expected = bits;
-    std::memcpy(normalized.data() + site.offset, rtxhdr::kOriginalPtx.data() + site.offset, 10);
-  }
-  if (!peak || !tolerance || !IsOriginalPtx(normalized)) return false;
-  for (int setting = 1001; setting <= 2000; ++setting) {
-    if (*peak == FloatBits(static_cast<float>(static_cast<double>(setting) / 1000.0)) &&
-        *tolerance == FloatBits(static_cast<float>(static_cast<double>(setting + 1) / 1000.0))) {
-      if (peakNits) *peakNits = setting;
-      return true;
-    }
-  }
-  return false;
-}
-
-std::optional<std::vector<std::uint8_t>> BuildPtxVariant(int peakNits) {
-  if (peakNits < 1000 || peakNits > 2000) return std::nullopt;
-  std::vector<std::uint8_t> bytes(rtxhdr::kOriginalPtx.begin(), rtxhdr::kOriginalPtx.end());
-  const auto tolerance = FloatBits(static_cast<float>(static_cast<double>(peakNits + 1) / 1000.0));
-  const auto peak = FloatBits(static_cast<float>(static_cast<double>(peakNits) / 1000.0));
-  for (const auto& site : rtxhdr::kPtxLiteralSites) {
-    const auto original = ReadPtxLiteral(bytes, site.offset);
-    if (!original || *original != (site.tolerance ? 0x3f8020c5u : 0x3f800000u))
-      return std::nullopt;
-    WritePtxLiteral(bytes, site.offset, site.tolerance ? tolerance : peak);
-  }
-  return bytes;
-}
-
-std::optional<CodeVariants> BuildCodeVariants(int peakNits) {
-  auto cubin = BuildVariant(peakNits);
-  auto ptx = BuildPtxVariant(peakNits);
-  if (!cubin || !ptx) return std::nullopt;
-  return CodeVariants{{std::move(*cubin), std::move(*ptx)}};
-}
-
-bool SelfTest() {
-  const std::vector<std::uint8_t> original(rtxhdr::kOriginalKernel.begin(),
-                                           rtxhdr::kOriginalKernel.end());
-  if (original.size() != kKernelSize || !IsOriginal(original)) {
-    RTXHDR_ERR << "Self-test failed: embedded original CUBIN length/content mismatch\n";
+// Accepts both CUDA ELF flavors: OSABI 0x33 / ABI 7 (SM in e_flags[0:8], the
+// carriers shipped through 621.14) and OSABI 0x41 / ABI 8 (SM in e_flags[8:16],
+// produced by CUDA 13 toolchains such as the driver's own JIT).
+bool ParseCudaElf(const std::uint8_t* p, std::size_t avail, ElfLayout& layout) {
+  if (avail < 64 || std::memcmp(p, "\x7f" "ELF\x02\x01\x01", 7) != 0 ||
+      (p[7] != 0x33 && p[7] != 0x41))
     return false;
-  }
-  const auto digest = Sha256Bytes(original.data(), original.size());
-  if (!digest || _stricmp(Hex(*digest).c_str(), kKernelHash) != 0) {
-    RTXHDR_ERR << "Self-test failed: original CUBIN SHA256 mismatch\n";
-    if (digest) RTXHDR_ERR << "  actual=" << Hex(*digest) << "\n";
-    return false;
-  }
-  RTXHDR_OUT << "Original CUBIN: " << original.size() << " bytes, SHA256=" << Hex(*digest)
-            << "\n";
-  for (const int setting : {1000, 1260, 2000}) {
-    const auto variant = BuildVariant(setting);
-    if (!variant) {
-      RTXHDR_ERR << "Self-test failed: could not generate peak " << setting << "\n";
+  const auto phoff = LoadLe<std::uint64_t>(p + 0x20);
+  const auto shoff = LoadLe<std::uint64_t>(p + 0x28);
+  const auto flags = LoadLe<std::uint32_t>(p + 0x30);
+  const auto phentsize = LoadLe<std::uint16_t>(p + 0x36);
+  const auto phnum = LoadLe<std::uint16_t>(p + 0x38);
+  const auto shentsize = LoadLe<std::uint16_t>(p + 0x3A);
+  const auto shnum = LoadLe<std::uint16_t>(p + 0x3C);
+  const auto shstrndx = LoadLe<std::uint16_t>(p + 0x3E);
+  if (shentsize != 64 || shnum == 0 || shnum > 4096 || shstrndx >= shnum) return false;
+  if (shoff > avail || std::uint64_t{shnum} * 64 > avail - shoff) return false;
+  std::uint64_t end = shoff + std::uint64_t{shnum} * 64;
+  if (phnum) {
+    if (phentsize < 56 || phoff > avail ||
+        std::uint64_t{phnum} * phentsize > avail - phoff)
       return false;
+    end = std::max<std::uint64_t>(end, phoff + std::uint64_t{phnum} * phentsize);
+  }
+  const std::uint8_t* table = p + shoff;
+  const auto strOffset = LoadLe<std::uint64_t>(table + 64 * shstrndx + 0x18);
+  const auto strSize = LoadLe<std::uint64_t>(table + 64 * shstrndx + 0x20);
+  if (strOffset > avail || strSize > avail - strOffset) return false;
+  layout = {};
+  for (unsigned i = 0; i < shnum; ++i) {
+    const std::uint8_t* header = table + 64 * i;
+    const auto name = LoadLe<std::uint32_t>(header);
+    const auto type = LoadLe<std::uint32_t>(header + 4);
+    const auto offset = LoadLe<std::uint64_t>(header + 0x18);
+    const auto size = LoadLe<std::uint64_t>(header + 0x20);
+    if (type != 8) {  // SHT_NOBITS occupies no file bytes
+      if (offset > avail || size > avail - offset) return false;
+      end = std::max<std::uint64_t>(end, offset + size);
     }
-    int detected = 0;
-    const bool recognized = setting == 1000 ? IsOriginal(*variant)
-                                           : IsPatched(*variant, &detected);
-    if (!recognized || (setting != 1000 && detected != setting)) {
-      RTXHDR_ERR << "Self-test failed: peak " << setting << " variant validation failed\n";
-      return false;
-    }
-    const auto variantHash = Sha256Bytes(variant->data(), variant->size());
-    std::size_t changed = 0;
-    for (std::size_t i = 0; i < original.size(); ++i)
-      changed += original[i] != (*variant)[i] ? 1u : 0u;
-    RTXHDR_OUT << "Variant peak " << setting << ": changed=" << changed
-              << ", SHA256=" << (variantHash ? Hex(*variantHash) : "<hash failed>") << "\n";
-    const std::size_t expectedChanged = setting == 1000 ? 0u : 108u;
-    if (changed != expectedChanged || !variantHash) {
-      RTXHDR_ERR << "Self-test failed: peak " << setting << " immediate-change count mismatch\n";
-      return false;
+    if (name >= strSize) return false;
+    const char* text = reinterpret_cast<const char*>(p + strOffset + name);
+    const auto room = static_cast<std::size_t>(strSize - name);
+    const void* terminator = std::memchr(text, 0, room);
+    if (!terminator) return false;
+    const std::string_view sectionName(text, static_cast<const char*>(terminator) - text);
+    if (sectionName == kDrtmText) {
+      ++layout.drtmTexts;
+      layout.text = static_cast<std::size_t>(offset);
+      layout.textSize = static_cast<std::size_t>(size);
     }
   }
-  const std::vector<std::uint8_t> originalPtx(rtxhdr::kOriginalPtx.begin(),
-                                              rtxhdr::kOriginalPtx.end());
-  const auto ptxHash = Sha256Bytes(originalPtx.data(), originalPtx.size());
-  if (!ptxHash || Hex(*ptxHash) != rtxhdr::kPtxSha256 || !IsOriginalPtx(originalPtx)) {
-    RTXHDR_ERR << "Self-test failed: original PTX length/content/SHA256 mismatch\n";
-    return false;
-  }
-  RTXHDR_OUT << "Original PTX: " << originalPtx.size() << " bytes, SHA256=" << Hex(*ptxHash) << "\n";
-  for (const int setting : {1000, 1001, 1260, 2000}) {
-    const auto variant = BuildPtxVariant(setting);
-    int detected = 0;
-    if (!variant || !(setting == 1000 ? IsOriginalPtx(*variant)
-                                     : IsPatchedPtx(*variant, &detected)) ||
-        (setting != 1000 && detected != setting)) {
-      RTXHDR_ERR << "Self-test failed: PTX peak " << setting << " variant validation failed\n";
-      return false;
-    }
-    const auto variantHash = Sha256Bytes(variant->data(), variant->size());
-    if (!variantHash || (setting == 1260 && Hex(*variantHash) !=
-        "0e431ae0c97477eb37dbd38618d184f4715529ab878007c72aae3a2f14a69c39")) {
-      RTXHDR_ERR << "Self-test failed: PTX variant does not match the independently generated manifest\n";
-      return false;
-    }
-    std::size_t changed = 0;
-    for (std::size_t i = 0; i < originalPtx.size(); ++i)
-      changed += originalPtx[i] != (*variant)[i] ? 1u : 0u;
-    RTXHDR_OUT << "PTX variant peak " << setting << ": changed=" << changed
-              << ", SHA256=" << Hex(*variantHash) << "\n";
-  }
-  auto damagedPtx = *BuildPtxVariant(1260);
-  damagedPtx.front() ^= 1;
-  if (IsOriginalPtx(damagedPtx) || IsPatchedPtx(damagedPtx) ||
-      BuildPtxVariant(999) || BuildPtxVariant(2001)) {
-    RTXHDR_ERR << "Self-test failed: invalid PTX range or unknown bytes were not rejected\n";
-    return false;
-  }
-  RTXHDR_OUT << "Self-test passed (no other process was accessed)\n";
+  layout.size = static_cast<std::size_t>(end);
+  layout.abi = p[7];
+  layout.sm = p[7] == 0x33 ? int(flags & 0xFF) : int((flags >> 8) & 0xFF);
   return true;
 }
 
-std::string StateText(RangeState state, int peak = 0) {
-  switch (state) {
-    case RangeState::kOriginal:
-      return "original";
-    case RangeState::kPatched:
-      return peak ? "patched(" + std::to_string(peak) + " nits)" : "patched";
-    default:
-      return "unknown/rejected";
+int PtxTargetSm(std::string_view header) {
+  const std::size_t target = FindText(header, 0, ".target sm_");
+  if (target == std::string_view::npos) return 0;
+  int sm = 0;
+  std::size_t i = target + 11;
+  for (; i < header.size() && i < target + 15 && header[i] >= '0' && header[i] <= '9'; ++i)
+    sm = sm * 10 + (header[i] - '0');
+  if (i < header.size() && std::isalpha(static_cast<unsigned char>(header[i]))) return -1;
+  return sm;
+}
+
+bool IsPtxTextByte(std::uint8_t b) { return b == '\t' || b == '\n' || b == '\r' || (b >= 0x20 && b < 0x7F); }
+
+// Finds every truehdr_drtm carrier inside one contiguous byte range.
+void ScanSpan(const std::uint8_t* data, std::size_t size, std::uintptr_t rva,
+              std::vector<Carrier>& out) {
+  const std::string_view text(reinterpret_cast<const char*>(data), size);
+  for (std::size_t pos = 0; pos + 8 <= size;) {
+    const void* hit = std::memchr(data + pos, 0x7F, size - pos);
+    if (!hit) break;
+    const auto at = static_cast<std::size_t>(static_cast<const std::uint8_t*>(hit) - data);
+    pos = at + 1;
+    if (size - at < 8 || std::memcmp(data + at + 1, "ELF\x02\x01\x01", 6) != 0 ||
+        (data[at + 7] != 0x33 && data[at + 7] != 0x41))
+      continue;
+    ElfLayout layout;
+    Carrier carrier;
+    carrier.kind = CarrierKind::kCubin;
+    carrier.rva = rva + at;
+    carrier.view = data + at;
+    carrier.elfAbi = data[at + 7];
+    if (ParseCudaElf(data + at, size - at, layout)) {
+      if (layout.drtmTexts == 0) continue;
+      carrier.size = layout.size;
+      carrier.sm = layout.sm;
+      carrier.codeOffset = layout.text;
+      carrier.codeSize = layout.textSize;
+      if (layout.drtmTexts != 1) carrier.reason = "several .text.truehdr_drtm sections";
+      out.push_back(carrier);
+      pos = at + layout.size;
+      continue;
+    }
+    // A CUDA ELF this parser cannot read must not hide a kernel: refuse if it
+    // names .text.truehdr_drtm before the next ELF header.
+    std::size_t limit = FindText(text, at + 4, "\x7f" "ELF");
+    if (limit == std::string_view::npos) limit = size;
+    if (FindText(text.substr(0, limit), at, kDrtmText) != std::string_view::npos) {
+      carrier.size = limit - at;
+      carrier.reason = "unparseable CUDA ELF containing .text.truehdr_drtm";
+      out.push_back(carrier);
+    }
+  }
+  for (std::size_t from = 0;;) {
+    const std::size_t entry = FindText(text, from, kPtxEntry);
+    if (entry == std::string_view::npos) break;
+    std::size_t start = entry;
+    const std::size_t floor = entry > (std::size_t{16} << 20) ? entry - (std::size_t{16} << 20) : 0;
+    while (start > floor && IsPtxTextByte(data[start - 1])) --start;
+    Carrier carrier;
+    carrier.kind = CarrierKind::kPtx;
+    carrier.rva = rva + start;
+    carrier.view = data + start;
+    carrier.codeOffset = entry - start;
+    carrier.sm = PtxTargetSm(text.substr(start, entry - start));
+    const void* nul = std::memchr(data + entry, 0, size - entry);
+    if (!nul) {
+      carrier.size = size - start;
+      carrier.reason = "unterminated PTX module";
+      out.push_back(carrier);
+      break;
+    }
+    const auto end = static_cast<std::size_t>(static_cast<const std::uint8_t*>(nul) - data) + 1;
+    carrier.size = end - start;
+    out.push_back(carrier);
+    from = end;
   }
 }
 
-bool QueryRange(HANDLE process, const ModuleInfo& module, std::vector<std::uint8_t>& bytes,
-                RangeState& state, int* peak = nullptr, CodeSource source = CodeSource::kCubin) {
-  state = RangeState::kUnknown;
-  if (peak) *peak = 0;
-  const auto rva = SourceRva(module.spec, source);
-  const auto size = SourceSize(source);
-  if (rva > module.size || size > static_cast<std::size_t>(module.size - rva)) {
-    RTXHDR_ERR << Narrow(module.name) << ": " << SourceName(source)
-              << " range is outside the module image; access denied\n";
+// Scans every initialized, readable, non-executable section of a PE image.
+// fileLayout selects raw file offsets (a mapped file) or RVAs (a loaded image).
+bool ScanImage(const std::uint8_t* image, std::size_t size, bool fileLayout,
+               std::vector<Carrier>& carriers, std::string& error) {
+  carriers.clear();
+  IMAGE_DOS_HEADER dos{};
+  IMAGE_NT_HEADERS64 nt{};
+  if (size < sizeof(dos)) {
+    error = "file is too small for a PE image";
     return false;
   }
-  if (!IsRangeReadable(process, module.base + rva, size)) return false;
-  bytes.resize(size);
-  if (!ReadRemote(process, module.base + rva, bytes.data(), bytes.size()))
+  std::memcpy(&dos, image, sizeof(dos));
+  if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 ||
+      static_cast<std::size_t>(dos.e_lfanew) > size - sizeof(nt)) {
+    error = "not a PE image";
     return false;
-  if (source == CodeSource::kCubin ? IsOriginal(bytes) : IsOriginalPtx(bytes)) {
-    state = RangeState::kOriginal;
-  } else if (source == CodeSource::kCubin ? IsPatched(bytes, peak) : IsPatchedPtx(bytes, peak)) {
-    state = RangeState::kPatched;
+  }
+  std::memcpy(&nt, image + dos.e_lfanew, sizeof(nt));
+  if (nt.Signature != IMAGE_NT_SIGNATURE || nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+      nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+    error = "not an x64 PE image";
+    return false;
+  }
+  const std::size_t table = static_cast<std::size_t>(dos.e_lfanew) +
+                            offsetof(IMAGE_NT_HEADERS64, OptionalHeader) +
+                            nt.FileHeader.SizeOfOptionalHeader;
+  const std::size_t count = nt.FileHeader.NumberOfSections;
+  if (table > size || count * sizeof(IMAGE_SECTION_HEADER) > size - table) {
+    error = "truncated PE section table";
+    return false;
+  }
+  for (std::size_t i = 0; i < count; ++i) {
+    IMAGE_SECTION_HEADER section{};
+    std::memcpy(&section, image + table + i * sizeof(section), sizeof(section));
+    const DWORD flags = section.Characteristics;
+    if (!(flags & IMAGE_SCN_CNT_INITIALIZED_DATA) || !(flags & IMAGE_SCN_MEM_READ) ||
+        (flags & IMAGE_SCN_MEM_EXECUTE))
+      continue;
+    std::size_t begin = fileLayout ? section.PointerToRawData : section.VirtualAddress;
+    std::size_t length = section.SizeOfRawData;
+    if (section.Misc.VirtualSize) length = std::min<std::size_t>(length, section.Misc.VirtualSize);
+    if (!length || begin >= size) continue;
+    length = std::min(length, size - begin);
+    ScanSpan(image + begin, length, section.VirtualAddress, carriers);
+  }
+  return true;
+}
+
+struct SassWord {
+  std::uint64_t lo = 0;
+  std::uint64_t hi = 0;
+  unsigned Op() const { return unsigned(lo & 0xFFF); }
+  unsigned Guard() const { return unsigned((lo >> 12) & 0xF); }
+  unsigned Ra() const { return unsigned((lo >> 24) & 0xFF); }
+  std::uint32_t Imm() const { return std::uint32_t(lo >> 32); }
+  unsigned Cmp() const { return unsigned((hi >> 12) & 0xF); }
+  unsigned Pd() const { return unsigned((hi >> 17) & 0x7); }
+  unsigned Pd2() const { return unsigned((hi >> 20) & 0x7); }
+  unsigned Pp() const { return unsigned((hi >> 23) & 0xF); }
+  bool ImmediateForm() const { return (Op() & 0xF00) == 0x800; }
+};
+
+// Volta+ 128-bit SASS (verified on sm75, sm80, sm89, sm120 and sm121 builds):
+// op lo[0:12], guard lo[12:16], Ra lo[24:32], imm32 lo[32:64]; FSETP compare
+// hi[12:16], Pd hi[17:20], Pd2 hi[20:23]; FSETP/FSEL/FMNMX predicate hi[23:27]
+// (bit 3 negates; FMNMX with PT selects the minimum).
+constexpr unsigned kOpFsetp = 0x80B, kOpFsel = 0x808, kOpFmnmx = 0x809;
+constexpr unsigned kCmpGe = 6, kPredTrue = 7, kPredNegate = 8;
+
+// The Oklab gamut mapping has three paths (full frame, left and right split).
+// Each tests the three candidate channels against [-0.001, tolerance] before
+// and inside its chroma bisection loop (18 tolerance immediates), then clamps
+// each candidate to the ceiling: FSETP.GE + FSEL !P (sm75/sm80) or FMNMX (newer
+// compilers). Every other use of 1.0 in the kernel is left alone.
+bool LocateSass(const std::uint8_t* elf, std::size_t text, std::size_t textSize,
+                const CeilingConstants& k, std::vector<PatchSite>& sites,
+                std::string& idiom, std::string& why) {
+  sites.clear();
+  if (textSize == 0 || textSize % 16) {
+    why = "kernel code size is not a multiple of 16 bytes";
+    return false;
+  }
+  const std::size_t count = textSize / 16;
+  std::vector<SassWord> code(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    std::memcpy(&code[i].lo, elf + text + 16 * i, 8);
+    std::memcpy(&code[i].hi, elf + text + 16 * i + 8, 8);
+  }
+  std::vector<std::size_t> tests;
+  for (std::size_t i = 0; i < count; ++i) {
+    if (!code[i].ImmediateForm() || code[i].Imm() != k.tolerance) continue;
+    if (code[i].Op() != kOpFsetp) {
+      why = "the gamut tolerance constant is used by a non-FSETP instruction";
+      return false;
+    }
+    tests.push_back(i);
+  }
+  if (tests.size() != 18) {
+    why = "expected 18 gamut tolerance tests, found " + std::to_string(tests.size());
+    return false;
+  }
+  for (const auto t : tests) {
+    if (code[t].Guard() != kPredTrue) {
+      why = "a gamut tolerance test is predicated";
+      return false;
+    }
+    bool partner = false;
+    for (std::size_t j = t >= 8 ? t - 8 : 0; j <= std::min(count - 1, t + 8) && !partner; ++j)
+      partner = code[j].Op() == kOpFsetp && code[j].Imm() == kLowerBoundBits &&
+                code[j].Ra() == code[t].Ra();
+    if (!partner) {
+      why = "a gamut tolerance test lacks its -0.001 lower-bound test";
+      return false;
+    }
+  }
+  std::vector<std::vector<std::size_t>> groups{{tests.front()}};
+  for (std::size_t i = 1; i < tests.size(); ++i) {
+    if (tests[i] - tests[i - 1] <= 8) groups.back().push_back(tests[i]);
+    else groups.push_back({tests[i]});
+  }
+  if (groups.size() != 6) {
+    why = "expected 6 three-channel gamut test groups, found " + std::to_string(groups.size());
+    return false;
+  }
+  for (const auto& group : groups) {
+    std::set<unsigned> registers;
+    for (const auto i : group) registers.insert(code[i].Ra());
+    if (group.size() != 3 || registers.size() != 3) {
+      why = "a gamut test group does not cover three distinct channels";
+      return false;
+    }
+  }
+  for (const auto t : tests) sites.push_back({std::uint32_t(text + 16 * t + 4), true});
+  int pairs = 0;
+  int minima = 0;
+  for (std::size_t path = 0; path < 3; ++path) {
+    const auto& first = groups[2 * path];
+    const auto& second = groups[2 * path + 1];
+    if (second.front() - first.back() > 160) {
+      why = "the two gamut tests of a path are too far apart";
+      return false;
+    }
+    std::set<unsigned> candidates;
+    for (const auto i : first) candidates.insert(code[i].Ra());
+    std::set<unsigned> tested = candidates;
+    for (const auto i : second) tested.insert(code[i].Ra());
+    const std::size_t begin = second.back() + 1;
+    const std::size_t end = std::min(count, begin + 64);
+    std::map<unsigned, std::vector<std::vector<std::size_t>>> clamps;
+    std::set<std::size_t> pairedSelects;
+    for (std::size_t j = begin; j < end; ++j) {
+      const auto& word = code[j];
+      if (!word.ImmediateForm() || word.Imm() != k.ceiling || !tested.count(word.Ra())) continue;
+      if (word.Op() == kOpFmnmx) {
+        if (word.Pp() != kPredTrue || word.Guard() != kPredTrue) {
+          why = "a ceiling FMNMX is not an unconditional minimum";
+          return false;
+        }
+        clamps[word.Ra()].push_back({j});
+        ++minima;
+      } else if (word.Op() == kOpFsetp) {
+        if (word.Cmp() != kCmpGe || word.Pd2() != kPredTrue || word.Pp() != kPredTrue ||
+            word.Guard() != kPredTrue) {
+          why = "a ceiling comparison is not FSETP.GE.AND Pn, PT, c, ceiling, PT";
+          return false;
+        }
+        std::vector<std::size_t> selects;
+        for (std::size_t s = j + 1; s < std::min(end, j + 25); ++s) {
+          const auto& select = code[s];
+          if (select.Op() == kOpFsel && select.Imm() == k.ceiling && select.Ra() == word.Ra() &&
+              select.Pp() == (kPredNegate | word.Pd()) && select.Guard() == kPredTrue)
+            selects.push_back(s);
+        }
+        if (selects.size() != 1) {
+          why = "a ceiling comparison has no unique FSEL partner";
+          return false;
+        }
+        pairedSelects.insert(selects.front());
+        clamps[word.Ra()].push_back({j, selects.front()});
+        ++pairs;
+      }
+    }
+    for (std::size_t j = begin; j < end; ++j) {
+      const auto& word = code[j];
+      if (word.Op() == kOpFsel && word.Imm() == k.ceiling && tested.count(word.Ra()) &&
+          !pairedSelects.count(j)) {
+        why = "an FSEL with the ceiling constant is not part of a recognized clamp";
+        return false;
+      }
+    }
+    if (clamps.size() != 3) {
+      why = "expected three clamped channels per path, found " + std::to_string(clamps.size());
+      return false;
+    }
+    for (const auto& [reg, entries] : clamps) {
+      if (entries.size() != 1 || !candidates.count(reg)) {
+        why = "a channel is clamped twice or is not a gamut candidate";
+        return false;
+      }
+      for (const auto i : entries.front()) sites.push_back({std::uint32_t(text + 16 * i + 4), false});
+    }
+  }
+  std::sort(sites.begin(), sites.end(),
+            [](const PatchSite& a, const PatchSite& b) { return a.offset < b.offset; });
+  idiom = pairs && !minima ? "FSETP+FSEL" : minima && !pairs ? "FMNMX" : "mixed";
+  return true;
+}
+
+std::string PtxLiteral(std::uint32_t bits) {
+  char text[11]{};
+  std::snprintf(text, sizeof(text), "0f%08X", static_cast<unsigned int>(bits));
+  return text;
+}
+
+struct PtxStatement {
+  std::string_view opcode;
+  bool guarded = false;
+  std::vector<std::pair<std::string_view, std::size_t>> operands;  // text, carrier offset
+};
+
+bool ParsePtxStatement(std::string_view carrier, std::size_t begin, std::size_t end,
+                       PtxStatement& out) {
+  const auto space = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
+  std::size_t i = begin;
+  while (i < end && space(carrier[i])) ++i;
+  if (i >= end || carrier[i] == '/') return false;
+  const auto token = [&]() {
+    const std::size_t start = i;
+    while (i < end && !space(carrier[i])) ++i;
+    const auto value = carrier.substr(start, i - start);
+    while (i < end && space(carrier[i])) ++i;
+    return value;
+  };
+  out = {};
+  std::string_view first = token();
+  if (!first.empty() && first.front() == '@') {
+    out.guarded = true;
+    first = token();
+  }
+  out.opcode = first;
+  const std::size_t semicolon = carrier.find(';', i);
+  if (semicolon == std::string_view::npos || semicolon >= end) return false;
+  std::size_t start = i;
+  for (std::size_t j = i; j <= semicolon; ++j) {
+    if (j != semicolon && carrier[j] != ',') continue;
+    std::size_t a = start;
+    std::size_t b = j;
+    while (a < b && space(carrier[a])) ++a;
+    while (b > a && space(carrier[b - 1])) --b;
+    out.operands.emplace_back(carrier.substr(a, b - a), a);
+    start = j + 1;
+  }
+  return true;
+}
+
+// PTX form of the same structure: 18 "setp.le.f32 %p, %fX, tolerance" tests on
+// nine candidate registers (each also tested against -0.001), and one ceiling
+// clamp per candidate, "setp.ge.f32 %pA, %fX, ceiling" + "selp.f32 %fY,
+// ceiling, %fX, %pA" or "min.f32 %fY, %fX, ceiling". The kernel has other
+// clamps to 1.0 (chroma and later output stages); those are not candidates.
+bool LocatePtx(const std::uint8_t* data, std::size_t size, std::size_t entry,
+               const CeilingConstants& k, std::vector<PatchSite>& sites, std::string& idiom,
+               std::string& why) {
+  sites.clear();
+  const std::string_view carrier(reinterpret_cast<const char*>(data), size);
+  std::size_t bodyEnd = FindText(carrier, entry + kPtxEntry.size(), ".entry ");
+  if (bodyEnd == std::string_view::npos) bodyEnd = size;
+  const std::string tolerance = PtxLiteral(k.tolerance);
+  const std::string ceiling = PtxLiteral(k.ceiling);
+  const std::string lower = PtxLiteral(kLowerBoundBits);
+  std::size_t occurrences = 0;
+  for (std::size_t at = FindText(carrier, entry, tolerance); at < bodyEnd;
+       at = FindText(carrier, at + 1, tolerance))
+    ++occurrences;
+  std::vector<PtxStatement> statements;
+  for (std::size_t begin = entry; begin < bodyEnd;) {
+    std::size_t end = carrier.find('\n', begin);
+    if (end == std::string_view::npos || end > bodyEnd) end = bodyEnd;
+    PtxStatement statement;
+    if (ParsePtxStatement(carrier, begin, end, statement)) statements.push_back(std::move(statement));
+    begin = end + 1;
+  }
+  std::vector<std::size_t> tests;
+  std::set<std::string_view> candidates;
+  for (const auto& s : statements) {
+    for (std::size_t o = 0; o < s.operands.size(); ++o) {
+      if (s.operands[o].first != tolerance) continue;
+      if (s.guarded || s.opcode != "setp.le.f32" || s.operands.size() != 3 || o != 2 ||
+          s.operands[0].first.substr(0, 2) != "%p" || s.operands[1].first.substr(0, 2) != "%f") {
+        why = "the gamut tolerance literal is used outside setp.le.f32 %p, %f, literal";
+        return false;
+      }
+      candidates.insert(s.operands[1].first);
+      tests.push_back(s.operands[2].second);
+    }
+  }
+  if (occurrences != 18 || tests.size() != 18) {
+    why = "expected 18 gamut tolerance tests, found " + std::to_string(tests.size()) + " of " +
+          std::to_string(occurrences) + " literals";
+    return false;
+  }
+  if (candidates.size() != 9) {
+    why = "expected 9 gamut candidate registers, found " + std::to_string(candidates.size());
+    return false;
+  }
+  for (const auto& candidate : candidates) {
+    const bool lowerBound = std::any_of(statements.begin(), statements.end(), [&](const auto& s) {
+      return !s.guarded && s.opcode == "setp.ge.f32" && s.operands.size() == 3 &&
+             s.operands[1].first == candidate && s.operands[2].first == lower;
+    });
+    if (!lowerBound) {
+      why = "a gamut candidate lacks its -0.001 lower-bound test";
+      return false;
+    }
+  }
+  std::map<std::string_view, std::vector<std::vector<std::size_t>>> clamps;
+  int pairs = 0;
+  int minima = 0;
+  for (const auto& s : statements) {
+    if (s.guarded || s.operands.size() != 3 || s.operands[2].first != ceiling ||
+        !candidates.count(s.operands[1].first))
+      continue;
+    if (s.opcode == "setp.ge.f32") {
+      const auto predicate = s.operands[0].first;
+      const auto value = s.operands[1].first;
+      std::vector<std::size_t> selects;
+      for (const auto& select : statements) {
+        if (!select.guarded && select.opcode == "selp.f32" && select.operands.size() == 4 &&
+            select.operands[1].first == ceiling && select.operands[2].first == value &&
+            select.operands[3].first == predicate)
+          selects.push_back(select.operands[1].second);
+      }
+      if (selects.size() != 1) {
+        why = "a ceiling comparison has no unique selp partner";
+        return false;
+      }
+      clamps[value].push_back({s.operands[2].second, selects.front()});
+      ++pairs;
+    } else if (s.opcode == "min.f32") {
+      clamps[s.operands[1].first].push_back({s.operands[2].second});
+      ++minima;
+    }
+  }
+  if (clamps.size() != candidates.size()) {
+    why = "expected one ceiling clamp per candidate, found " + std::to_string(clamps.size());
+    return false;
+  }
+  for (const auto& [value, entries] : clamps) {
+    if (entries.size() != 1) {
+      why = "a gamut candidate is clamped to the ceiling more than once";
+      return false;
+    }
+    for (const auto offset : entries.front()) sites.push_back({std::uint32_t(offset), false});
+  }
+  for (const auto offset : tests) sites.push_back({std::uint32_t(offset), true});
+  std::sort(sites.begin(), sites.end(),
+            [](const PatchSite& a, const PatchSite& b) { return a.offset < b.offset; });
+  idiom = pairs && !minima ? "setp+selp" : minima && !pairs ? "min" : "mixed";
+  return true;
+}
+
+bool UsableOn(const Carrier& carrier, int deviceSm) {
+  if (carrier.sm == 0) return true;  // unknown target: treat as relevant so it can reject
+  if (carrier.sm < 0) return false;  // architecture-specific PTX target
+  if (carrier.kind == CarrierKind::kPtx) return carrier.sm <= deviceSm;
+  return carrier.sm / 10 == deviceSm / 10 && carrier.sm <= deviceSm;
+}
+
+// Classifies a scanned carrier as original, patched to peakNits, or invalid.
+// carrier.view must still be mapped.
+void ClassifyCarrier(Carrier& carrier, int peakNits) {
+  carrier.sha256 = Sha256Hex(carrier.view, carrier.size);
+  if (!carrier.reason.empty()) {
+    carrier.state = CarrierState::kInvalid;
+    return;
+  }
+  const auto locate = [&](const CeilingConstants& k, std::string& why) {
+    return carrier.kind == CarrierKind::kCubin
+               ? LocateSass(carrier.view, carrier.codeOffset, carrier.codeSize, k, carrier.sites,
+                            carrier.idiom, why)
+               : LocatePtx(carrier.view, carrier.size, carrier.codeOffset, k, carrier.sites,
+                           carrier.idiom, why);
+  };
+  std::string why;
+  std::string ignored;
+  if (locate(kOriginalConstants, why)) {
+    carrier.state = CarrierState::kOriginal;
+  } else if (locate(TargetConstants(peakNits), ignored)) {
+    carrier.state = CarrierState::kPatched;
   } else {
-    state = RangeState::kUnknown;
+    carrier.state = CarrierState::kInvalid;
+    carrier.reason = why;
+    carrier.sites.clear();
+    carrier.idiom.clear();
   }
-  return true;
+  carrier.known = nullptr;
+  for (const auto& known : kKnownCarriers) {
+    if (carrier.state != CarrierState::kInvalid &&
+        carrier.sha256 == (carrier.state == CarrierState::kPatched ? known.patched : known.original))
+      carrier.known = &known;
+  }
 }
 
-bool ValidateModuleFile(const ModuleInfo& module, std::string* actual = nullptr) {
-  const auto digest = Sha256File(module.path);
-  if (!digest) {
-    RTXHDR_ERR << "Failed to read module hash: " << Narrow(module.path) << "\n";
-    return false;
+// Returns the patched copy of an original carrier; only the located immediates change.
+std::optional<std::vector<std::uint8_t>> BuildPatchedCarrier(const Carrier& carrier,
+                                                             const std::uint8_t* original,
+                                                             int peakNits) {
+  if (carrier.state != CarrierState::kOriginal || carrier.sites.empty()) return std::nullopt;
+  std::vector<std::uint8_t> bytes(original, original + carrier.size);
+  const auto target = TargetConstants(peakNits);
+  for (const auto& site : carrier.sites) {
+    const std::uint32_t before = site.tolerance ? kOriginalConstants.tolerance : kOriginalConstants.ceiling;
+    const std::uint32_t after = site.tolerance ? target.tolerance : target.ceiling;
+    if (carrier.kind == CarrierKind::kCubin) {
+      if (site.offset > bytes.size() || bytes.size() - site.offset < 4) return std::nullopt;
+      if (LoadLe<std::uint32_t>(bytes.data() + site.offset) != before) return std::nullopt;
+      std::memcpy(bytes.data() + site.offset, &after, 4);
+    } else {
+      const std::string old = PtxLiteral(before);
+      const std::string replacement = PtxLiteral(after);
+      if (site.offset > bytes.size() || bytes.size() - site.offset < old.size() ||
+          std::memcmp(bytes.data() + site.offset, old.data(), old.size()) != 0)
+        return std::nullopt;
+      std::memcpy(bytes.data() + site.offset, replacement.data(), replacement.size());
+    }
   }
-  const std::string value = Hex(*digest);
-  if (actual) *actual = value;
-  if (_stricmp(value.c_str(), module.spec.fileSha256) != 0) {
-    RTXHDR_ERR << "Version mismatch; write refused: " << Narrow(module.path) << "\n"
-              << "  actual SHA256=" << value << "\n"
-              << "  expected SHA256=" << module.spec.fileSha256 << "\n";
-    return false;
-  }
-  return true;
+  return bytes;
 }
 
-bool ValidateSizeField(HANDLE process, const ModuleInfo& module) {
-  if (!module.spec.hasSizeField) return true;
-  std::uint32_t size = 0;
-  if (!ReadRemote(process, module.base + module.spec.rva - kSizeFieldDelta, &size,
-                  sizeof(size))) {
-    RTXHDR_ERR << "Failed to read the CUBIN size field\n";
-    return false;
+std::string DescribeCarrier(const Carrier& carrier) {
+  std::ostringstream out;
+  if (carrier.kind == CarrierKind::kCubin) {
+    out << "CUBIN sm" << carrier.sm << " (ELF OSABI 0x" << std::hex << carrier.elfAbi << std::dec
+        << ')';
+  } else {
+    out << "PTX target " << (carrier.sm > 0 ? "sm_" + std::to_string(carrier.sm) : "unknown");
   }
-  if (size != kKernelSize) {
-    RTXHDR_ERR << "CUBIN size mismatch: " << size << ", expected " << kKernelSize << "\n";
-    return false;
+  out << " rva=0x" << std::hex << carrier.rva << std::dec << " size=" << carrier.size;
+  if (!carrier.sha256.empty()) out << " sha256=" << carrier.sha256.substr(0, 16);
+  if (carrier.state == CarrierState::kInvalid) {
+    out << " state=invalid reason=\"" << carrier.reason << '"';
+  } else {
+    const auto tolerance = std::count_if(carrier.sites.begin(), carrier.sites.end(),
+                                         [](const PatchSite& s) { return s.tolerance; });
+    out << " state=" << (carrier.state == CarrierState::kOriginal ? "original" : "patched")
+        << " sites=" << carrier.sites.size() << " (" << tolerance << " tolerance + "
+        << carrier.sites.size() - tolerance << " ceiling, " << carrier.idiom << ") tier="
+        << (carrier.known ? "known" : "structural");
   }
-  return true;
+  if (!carrier.usable) out << "; not executable on SM 8.9, left unchanged";
+  return out.str();
 }
 
 class SuspendedThreads {
@@ -764,6 +1153,43 @@ bool WriteRemote(HANDLE process, DWORD pid, std::uintptr_t address,
   return false;
 }
 
+struct CarrierWrite {
+  std::string label;
+  std::uintptr_t address = 0;
+  std::vector<std::uint8_t> before;
+  std::vector<std::uint8_t> after;
+};
+
+// All-or-nothing over every carrier of every module: each region is rechecked
+// after thread suspension, written with readback, and earlier regions are
+// rolled back if a later one fails.
+bool ApplyCarrierWrites(HANDLE process, DWORD pid, const std::vector<CarrierWrite>& writes,
+                        bool debugEventStopped = false) {
+  SuspendedThreads suspended(pid);
+  if (!debugEventStopped && !suspended.SuspendAll()) return false;
+  for (const auto& write : writes) {
+    std::vector<std::uint8_t> current(write.before.size());
+    if (!ReadRemote(process, write.address, current.data(), current.size()) ||
+        current != write.before) {
+      RTXHDR_ERR << write.label << " changed after threads were suspended; no carrier was written\n";
+      return false;
+    }
+  }
+  std::size_t done = 0;
+  for (; done < writes.size(); ++done) {
+    const auto& write = writes[done];
+    if (!WriteRemote(process, pid, write.address, write.before, write.after, true)) break;
+  }
+  if (done == writes.size()) return true;
+  RTXHDR_ERR << writes[done].label << " update failed; rolling back " << done
+             << " carrier(s) written earlier in this transaction\n";
+  for (std::size_t i = done; i-- > 0;) {
+    if (!WriteRemote(process, pid, writes[i].address, writes[i].after, writes[i].before, true))
+      RTXHDR_ERR << writes[i].label << " rollback failed; complete restoration cannot be confirmed\n";
+  }
+  return false;
+}
+
 struct CudaFns {
   using Result = int;
   using Init = Result(__stdcall*)(unsigned int);
@@ -860,90 +1286,6 @@ bool OpenTarget(DWORD pid, Handle& process) {
 bool ProcessModules(DWORD pid, std::vector<ModuleInfo>& modules) {
   modules = ModulesForPid(pid);
   if (modules.empty()) return false;
-  return true;
-}
-
-bool UpdateModuleSources(HANDLE process, DWORD pid, const ModuleInfo& module,
-                         const CodeVariants& targets, int peakNits, bool restore,
-                         bool quietIfAlready, bool debugEventStopped = false,
-                         bool moduleAlreadyLoaded = false) {
-  if (!ValidateModuleFile(module) || !ValidateSizeField(process, module)) return false;
-  CodeVariants current;
-  std::array<RangeState, 2> states{};
-  std::array<int, 2> peaks{};
-  // Validate both carriers before writing either. In particular, an older
-  // CUBIN-only patch is not complete when the PTX carrier is still original.
-  for (const auto source : kCodeSources) {
-    const auto i = static_cast<std::size_t>(source);
-    if (!QueryRange(process, module, current[i], states[i], &peaks[i], source)) {
-      RTXHDR_ERR << Narrow(module.name) << ": failed to read the " << SourceName(source) << " range\n";
-      return false;
-    }
-  }
-  const bool already = current == targets;
-  if (!(quietIfAlready && already)) {
-    for (const auto source : kCodeSources) {
-      const auto i = static_cast<std::size_t>(source);
-      RTXHDR_OUT << "PID " << pid << ' ' << Narrow(module.name) << ' ' << SourceName(source)
-                << " CPU source data " << StateText(states[i], peaks[i]) << "\n";
-    }
-  }
-  for (const auto source : kCodeSources) {
-    const auto i = static_cast<std::size_t>(source);
-    if (states[i] == RangeState::kUnknown) {
-      RTXHDR_ERR << "Write refused: " << SourceName(source) << " bytes are not a known original or variant\n";
-      return false;
-    }
-  }
-  if (already) {
-    if (!quietIfAlready)
-      RTXHDR_OUT << "CUBIN and PTX CPU source data already match the target; this does not prove the GPU reloaded them\n";
-    return true;
-  }
-
-  CodeVariants check = current;
-  SuspendedThreads suspended(pid);
-  if (!debugEventStopped && !suspended.SuspendAll()) return false;
-  for (const auto source : kCodeSources) {
-    const auto i = static_cast<std::size_t>(source);
-    const auto address = module.base + SourceRva(module.spec, source);
-    if (!ReadRemote(process, address, check[i].data(), check[i].size()) || check[i] != current[i]) {
-      RTXHDR_ERR << SourceName(source) << " changed after threads were suspended; refusing to overwrite either code source\n";
-      return false;
-    }
-  }
-  std::array<bool, 2> written{};
-  for (const auto source : kCodeSources) {
-    const auto i = static_cast<std::size_t>(source);
-    if (current[i] == targets[i]) continue;
-    const auto address = module.base + SourceRva(module.spec, source);
-    // Both writes share one thread-suspension window. WriteRemote still checks
-    // its own snapshot and verifies write/readback/protection restoration.
-    if (!WriteRemote(process, pid, address, current[i], targets[i], true)) {
-      RTXHDR_ERR << SourceName(source) << " update failed; rolling back other code sources changed in this transaction\n";
-      for (std::size_t previous = i; previous-- > 0;) {
-        if (!written[previous]) continue;
-        const auto priorSource = static_cast<CodeSource>(previous);
-        if (!WriteRemote(process, pid, module.base + SourceRva(module.spec, priorSource),
-                         targets[previous], current[previous], true)) {
-          RTXHDR_ERR << SourceName(priorSource) << " cross-source rollback failed; complete restoration cannot be confirmed\n";
-        }
-      }
-      return false;
-    }
-    written[i] = true;
-  }
-  for (const auto source : kCodeSources) {
-    if (written[static_cast<std::size_t>(source)])
-      RTXHDR_OUT << (restore ? "Restored" : "Wrote") << " and verified by readback "
-                << Narrow(module.name) << ' ' << SourceName(source) << "\n";
-  }
-  RTXHDR_OUT << "CUBIN and PTX CPU source data were " << (restore ? "restored to the original state" : "matched to peak " +
-      std::to_string(peakNits) + " nits");
-  if (moduleAlreadyLoaded) RTXHDR_OUT << "; the module already existed when attached and running GPU kernels will not refresh automatically";
-  else if (debugEventStopped) RTXHDR_OUT << "; the module-load event has not yet been released";
-  else RTXHDR_OUT << "; running GPU kernels will not refresh automatically";
-  RTXHDR_OUT << "\n";
   return true;
 }
 
